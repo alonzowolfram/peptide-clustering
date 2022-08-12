@@ -1,0 +1,169 @@
+---
+title: "Peptide sequence analysis and clustering"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+# Setup
+```{r eval=TRUE, include=FALSE}
+library(plyr)
+library(dplyr)
+library(ggpubr) # For boxplots.
+library(magrittr) # set_rownames function.
+library(reshape) # Melting the amino acid substitution cost matrix into a lookup table. 
+library(reshape2)
+library(stringr) # For string functions.
+library(WeightedCluster) # For finding the ideal number of clusters given a distance/dissimilarity matrix. 
+library(xlsx) # For writing Excel files.
+
+# Read in the amino acid substitution cost matrix. 
+sub_costs = read.csv("amino_acid_substitution_costs.csv", header = T)
+rownames(sub_costs) = sub_costs[,1]
+sub_costs = sub_costs[,2:ncol(sub_costs)]
+# Melt into table. 
+sub_costs_melted = melt(sub_costs)
+sub_costs_melted = data.frame(
+  Res1 = sub_costs_melted[,1],
+  Res2 = rep(rownames(sub_costs), length(rownames(sub_costs))),
+  Cost = sub_costs_melted[,2]
+)
+
+# Read in the functions.
+source("Scripts/functions.R")
+
+# Read in the cleaned sequencing data.
+seq_data_cleaned = readRDS("sample_NGS_data.rds")
+dat = seq_data_cleaned$Round_7_at_25C
+dat$SeqCount = dat$SeqCount %>% as.numeric
+dat$ReadsPerMillion = dat$ReadsPerMillion %>% as.numeric
+rownames(dat) = 1:nrow(dat)
+```
+
+# Clustering
+```{r}
+# Find where to set a cutoff for the sequence counts.
+seq_count_cutoff = 10 #elbowPoint(1:nrow(dat), dat$SeqCount)$y
+dat2 = dat %>% filter(SeqCount >= seq_count_cutoff)
+sequences = dat2$Seq
+
+# Filter to include only peptides that follow the M-8-K pattern. 
+sequences = sequences %>% regexPipes::grep("M.{8}K", value = T) %>% .[str_length(.)==10]
+
+# Create a distance matrix if it doesn't already exist.
+if(!file.exists("Round_7_at_25C_dist_mat.rds")) {
+  # Given a vector x of sequences, generate all possible pairwise combinations and run LevenshteinDistance() on each pair to create a distance matrix.
+  system.time({
+    dist_vec = combn(sequences, 2, FUN = LevenshteinDistance, simplify = TRUE)
+  })
+  combs = combn(sequences, 2, simplify = T) %>% t
+  dist = matrix(0, nrow = length(sequences), ncol = length(sequences))
+  rownames(dist) = sequences
+  colnames(dist) = sequences
+
+  starting_index = 1 # Index of dist_vec.
+  ending_row = nrow(dist)
+  for(i in 1:ncol(dist)) {
+    if(i < ncol(dist)) {
+      sequence = unique(combs[,1])[i]
+  
+      # Get the number of combinations that have "sequence" as their first sequence.
+      num_combos = nrow(combs[combs[,1]==sequence,])
+  
+      if(!is.null(num_combos)) {
+        # Set the ending row. 
+        ending_index = starting_index + num_combos - 1
+    
+        # Get the corresponding distances from dist_vec.
+        distances = dist_vec[starting_index:ending_index]
+  
+        # Update the dist matrix.
+        starting_row = i + 1
+        dist[starting_row:ending_row,i] = distances
+  
+        # Update starting_row for the next loop. 
+        starting_index = ending_index + 1
+      }
+    }
+  }
+
+  # Convert dist to a distance matrix.
+  dist = as.dist(dist)
+  # Save the distance matrix.
+  saveRDS(dist, "Round_7_at_25C_dist_mat.rds")
+} else {
+  dist = readRDS("Round_7_at_25C_dist_mat.rds")
+}
+
+
+# Cluster the sequences using the distance matrix. 
+methods = c("ward.D", "ward.D2", "single", "complete", "average", "mcquitty", "median", "centroid")
+hc_list = list()
+for(method in methods) {
+  hc_list[[method]] = hclust(dist, method = method)
+  plot(hc_list[[method]], hang = -1)
+}
+
+# Get optimal number of clusters.
+# https://stackoverflow.com/a/57722328
+hcRange = as.clustrange(hc_list[["ward.D2"]], diss = dist, ncluster = 10) 
+summary(hcRange)
+hcRange = as.clustrange(hc_list[["ward.D2"]], diss = dist, ncluster = 30) 
+summary(hcRange)
+hcRange = as.clustrange(hc_list[["ward.D2"]], diss = dist, ncluster = 50) 
+summary(hcRange)
+hcRange = as.clustrange(hc_list[["ward.D2"]], diss = dist, ncluster = 100) 
+summary(hcRange)
+
+# Cut tree into n clusters based on results above.
+n_clust = 20
+plot(hc_list[["ward.D2"]], hang = -1)
+rect.hclust(hc_list[["ward.D2"]], k = n_clust)
+# Get cluster IDs
+groups = cutree(hc_list[["ward.D2"]], k = n_clust)
+
+```
+
+# Cluster analysis
+```{r}
+# Affix cluster membership to each sequence. 
+dat2 = dat2 %>% filter(Seq %in% sequences)
+if(identical(names(groups), dat2$Seq)) {
+  dat2$Group = as.factor(groups)
+}
+
+# Affix ranking score to each sequence. 
+dat2$RankScore = rev(seq(1:nrow(dat2)))
+
+# Compare the ranking scores.
+# http://www.sthda.com/english/wiki/kruskal-wallis-test-in-r
+group_by(dat2, Group) %>%
+  summarise(
+    count = n(),
+    median = median(RankScore, na.rm = TRUE),
+    IQR = IQR(RankScore, na.rm = TRUE)
+  )
+
+# Reorder the groups by median. 
+dat2$Group = factor(dat2$Group, levels = dat2 %>% group_by(Group) %>% summarise(MedianRankScore = median(RankScore, na.rm = TRUE)) %>% arrange(desc(MedianRankScore)) %>% dplyr::select(Group) %>% unlist %>% as.character)
+
+# Plot.
+ggboxplot(dat2, x = "Group", y = "RankScore",
+          color = "Group",
+          ylab = "Rank score", xlab = "Group (in order of descending median rank score)") +
+  theme(legend.position = "none")
+
+# Perform Kruskal-Wallis test. 
+kruskal.test(RankScore ~ Group, data = dat2) 
+pairwise.wilcox.test(dat2$RankScore, dat2$Group,
+                 p.adjust.method = "BH")$p.value %>% write.csv("pairwise_test_results.csv")
+
+# Export results by group to Excel.
+first_sheet = dat2 %>% filter(Group==levels(dat2$Group)[1])
+write.xlsx(first_sheet, file="Round_7_at_25C_clustering_results_by_group.xlsx", sheetName=paste0("Group 4"), row.names=FALSE)
+for(group_name in levels(dat2$Group)[2:length(levels(dat2$Group))]) {
+  sheet = dat2 %>% filter(Group==group_name)
+  write.xlsx(sheet, file="Round_7_at_25C_clustering_results_by_group.xlsx", sheetName=paste0("Group ", group_name), append=TRUE, row.names=FALSE)
+}
+
+```
