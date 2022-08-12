@@ -30,10 +30,10 @@ sub_costs_melted = data.frame(
 )
 
 # Read in the functions.
-source("Scripts/functions.R")
+source("functions.R")
 
 # Read in the cleaned sequencing data.
-seq_data_cleaned = readRDS("sample_NGS_data.rds")
+seq_data_cleaned = readRDS("NGS_data.rds")
 dat = seq_data_cleaned$Round_7_at_25C
 dat$SeqCount = dat$SeqCount %>% as.numeric
 dat$ReadsPerMillion = dat$ReadsPerMillion %>% as.numeric
@@ -47,10 +47,12 @@ seq_count_cutoff = 10 #elbowPoint(1:nrow(dat), dat$SeqCount)$y
 dat2 = dat %>% filter(SeqCount >= seq_count_cutoff)
 sequences = dat2$Seq
 
-# Filter to include only peptides that follow the M-8-K pattern. 
-sequences = sequences %>% regexPipes::grep("M.{8}K", value = T) %>% .[str_length(.)==10]
+# Filter to include only peptides that follow a certain pattern (M-8-K).
+pattern = "M.{8}K"
+sequences = sequences %>% regexPipes::grep(pattern, value = T) %>% .[str_length(.)==10]
 
 # Create a distance matrix if it doesn't already exist.
+# Uses the Wagner-Fischer algorithm.
 if(!file.exists("Round_7_at_25C_dist_mat.rds")) {
   # Given a vector x of sequences, generate all possible pairwise combinations and run LevenshteinDistance() on each pair to create a distance matrix.
   system.time({
